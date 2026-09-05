@@ -1,0 +1,11 @@
+/tailscale-companion
+/independent-tailscale
+/companion.json
+/tailscaled.json
+*.local.md
+*.test
+*.out
+.env*
+*.log
+*.tfstate*
+.DS_Store

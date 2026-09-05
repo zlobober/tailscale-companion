@@ -1,0 +1,16 @@
+{
+  "version": "alpha0",
+  "locked": false,
+  "enabled": true,
+  "hostname": "personal-mac",
+  "acceptDNS": false,
+  "acceptRoutes": false,
+  "exitNode": "",
+  "allowLANWhileUsingExitNode": false,
+  "advertiseRoutes": [],
+  "advertiseExitNode": false,
+  "runSSHServer": false,
+  "autoUpdate": {
+    "apply": false
+  }
+}

@@ -1,0 +1,198 @@
+diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
+index d7c19f5..42c9d70 100644
+--- a/cmd/tailscaled/tailscaled.go
++++ b/cmd/tailscaled/tailscaled.go
+@@ -125,6 +125,8 @@ func defaultPort() uint16 {
+ 	// or comma-separated list thereof.
+ 	tunname string
+ 
++	privateNoRoutes bool // private macOS mode: leave route management to the operator
++
+ 	cleanUp             bool
+ 	confFile            string // empty, file path, or "vm:user-data"
+ 	debug               string
+@@ -211,6 +213,9 @@ func main() {
+ 		flag.StringVar(&args.debug, "debug", "", "listen address ([ip]:port) of optional debug server")
+ 	}
+ 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
++	if runtime.GOOS == "darwin" {
++		flag.BoolVar(&args.privateNoRoutes, "private-no-routes", false, "private macOS option: configure tunnel addresses but do not manage routes; does not disable DNS management")
++	}
+ 	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
+ 	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
+ 	if buildfeatures.HasTPM {
+@@ -863,6 +868,10 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
+ 			return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
+ 		}
+ 		conf.DNS = d
++		if args.privateNoRoutes {
++			logf("WARNING: --private-no-routes enabled; manage routes manually (tunnel addresses and DNS configuration are unaffected)")
++			r = &noRoutesRouter{Router: r}
++		}
+ 		conf.Router = r
+ 		if handleSubnetsInNetstack() {
+ 			netstackSubnetRouter = true
+diff --git a/cmd/tailscaled/router_no_routes.go b/cmd/tailscaled/router_no_routes.go
+new file mode 100644
+index 0000000..d740cea
+--- /dev/null
++++ b/cmd/tailscaled/router_no_routes.go
+@@ -0,0 +1,33 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package main
++
++import "tailscale.com/wgengine/router"
++
++// noRoutesRouter preserves interface setup and teardown, but keeps all routes
++// out of the OS router's desired configuration. It is only enabled by the
++// private macOS daemon flag: other OS routers may implicitly manage routes
++// outside Config.Routes and Config.LocalRoutes.
++//
++// On macOS, assigning tunnel addresses can still create implicit kernel routes.
++// This does not suppress those routes, nor does it disable DNS configuration.
++// The wrapper must be installed before the first Set and remain in place for
++// the router's lifetime, so the underlying router never owns explicit routes
++// that it could later remove (including on a nil/shutdown configuration).
++// Manually installed routes are the operator's responsibility.
++type noRoutesRouter struct {
++	router.Router
++}
++
++func (r *noRoutesRouter) Set(cfg *router.Config) error {
++	if cfg == nil {
++		return r.Router.Set(nil)
++	}
++	// Do not mutate the engine's configuration: it is also used to detect
++	// changes and may be consumed by other subsystems.
++	cfg = cfg.Clone()
++	cfg.Routes = nil
++	cfg.LocalRoutes = nil
++	return r.Router.Set(cfg)
++}
+diff --git a/cmd/tailscaled/router_no_routes_test.go b/cmd/tailscaled/router_no_routes_test.go
+new file mode 100644
+index 0000000..372d0a4
+--- /dev/null
++++ b/cmd/tailscaled/router_no_routes_test.go
+@@ -0,0 +1,119 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package main
++
++import (
++	"errors"
++	"net/netip"
++	"reflect"
++	"testing"
++
++	"tailscale.com/wgengine/router"
++)
++
++type recordingNoRoutesRouter struct {
++	configs []*router.Config
++	up      bool
++	closed  bool
++	err     error
++}
++
++func (r *recordingNoRoutesRouter) Up() error {
++	r.up = true
++	return r.err
++}
++
++func (r *recordingNoRoutesRouter) Set(cfg *router.Config) error {
++	r.configs = append(r.configs, cfg)
++	return r.err
++}
++
++func (r *recordingNoRoutesRouter) Close() error {
++	r.closed = true
++	return r.err
++}
++
++func TestNoRoutesRouter(t *testing.T) {
++	base := new(recordingNoRoutesRouter)
++	r := &noRoutesRouter{Router: base}
++	if err := r.Up(); err != nil || !base.up {
++		t.Fatalf("Up not delegated: %v", err)
++	}
++
++	cfg := &router.Config{
++		LocalAddrs: []netip.Prefix{
++			netip.MustParsePrefix("100.100.42.10/32"),
++			netip.MustParsePrefix("fd7a:115c:a1e0::10/128"),
++		},
++		Routes: []netip.Prefix{
++			netip.MustParsePrefix("100.64.0.0/10"),
++			netip.MustParsePrefix("100.100.42.42/32"),
++			netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
++			netip.MustParsePrefix("192.168.42.0/24"),
++			netip.MustParsePrefix("0.0.0.0/0"),
++			netip.MustParsePrefix("::/0"),
++		},
++		LocalRoutes:       []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
++		SubnetRoutes:      []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")},
++		NewMTU:            1280,
++		SNATSubnetRoutes:  true,
++		StatefulFiltering: true,
++	}
++	original := cfg.Clone()
++	want := cfg.Clone()
++	want.Routes = nil
++	want.LocalRoutes = nil
++
++	// Repeated reconfiguration must never pass routes to the OS router.
++	for range 2 {
++		if err := r.Set(cfg); err != nil {
++			t.Fatal(err)
++		}
++		got := base.configs[len(base.configs)-1]
++		if !reflect.DeepEqual(got, want) {
++			t.Fatalf("Set got %+v; want %+v", got, want)
++		}
++		if !reflect.DeepEqual(cfg, original) {
++			t.Fatal("Set mutated the engine's configuration")
++		}
++		// Even a downstream mutation must not alter the engine's addresses.
++		got.LocalAddrs[0] = netip.MustParsePrefix("100.100.42.20/32")
++		if !reflect.DeepEqual(cfg, original) {
++			t.Fatal("forwarded configuration aliases engine slices")
++		}
++	}
++
++	if err := r.Set(&router.Config{}); err != nil {
++		t.Fatal(err)
++	}
++	if got := base.configs[len(base.configs)-1]; !reflect.DeepEqual(got, &router.Config{}) {
++		t.Fatalf("empty configuration changed: %+v", got)
++	}
++	if err := r.Set(nil); err != nil {
++		t.Fatal(err)
++	}
++	if base.configs[len(base.configs)-1] != nil {
++		t.Fatal("shutdown configuration was not forwarded as nil")
++	}
++	if err := r.Close(); err != nil || !base.closed {
++		t.Fatalf("Close not delegated: %v", err)
++	}
++}
++
++func TestNoRoutesRouterErrors(t *testing.T) {
++	want := errors.New("OS router failure")
++	r := &noRoutesRouter{Router: &recordingNoRoutesRouter{err: want}}
++	for name, f := range map[string]func() error{
++		"up":       r.Up,
++		"set":      func() error { return r.Set(&router.Config{}) },
++		"shutdown": func() error { return r.Set(nil) },
++		"close":    r.Close,
++	} {
++		t.Run(name, func(t *testing.T) {
++			if err := f(); !errors.Is(err, want) {
++				t.Fatalf("got %v; want %v", err, want)
++			}
++		})
++	}
++}
