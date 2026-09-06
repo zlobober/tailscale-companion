@@ -4,7 +4,7 @@ Run a second Tailscale tailnet alongside the official macOS app, with narrowly
 controlled IPv4 routing and a background service that does not need a terminal.
 
 **Unofficial, experimental, and macOS-only.** This project is not affiliated with
-or endorsed by Tailscale. The menu-bar UI is planned, not implemented yet.
+or endorsed by Tailscale. Includes a native macOS menu-bar app.
 
 ## The problem
 
@@ -49,23 +49,26 @@ routing, **not separate network namespaces or a security boundary**.
 ## Status and scope
 
 Implemented: command-line supervisor, route lifecycle, browser-login initiation,
-root-owned installation/migration, and LaunchDaemon support.
+root-owned installation/migration, LaunchDaemon support, and a native menu-bar app.
 
-Planned menu-bar UI, deliberately limited to:
+The menu-bar UI is deliberately limited to:
 
 1. Show secondary service/connection/routing status.
 2. Start the secondary service.
 3. Shut down the secondary service and remove its owned route.
 
-The UI should use native macOS styling, feel familiar next to the official app,
-and have a distinct personal icon, such as a house/network symbol. It must respect
-administrator authorization. Account switching, device browsing, exit-node
-selection, DNS settings, and other official-app features are out of scope.
+The UI uses native AppKit menus and a monochrome house icon with a state badge,
+clearly distinct from the official app's dots. Start/Shut Down requests use macOS's
+administrator prompt and target only the companion LaunchDaemon. Account switching,
+device browsing, exit-node selection, DNS settings, and other official-app features
+are out of scope.
 
 ## Requirements
 
 - macOS; the current paths and daemon build have been exercised on Apple Silicon.
 - Go 1.26 or newer for building.
+- For the menu-bar app: macOS 14+, Swift 6+, and current Xcode Command Line Tools
+  (or full Xcode). No external Swift package dependencies are needed.
 - Homebrew's **formula**, not the GUI cask: `brew install --formula tailscale`.
   Development expects its CLI at `/opt/homebrew/opt/tailscale/bin/tailscale`.
 - The patched daemon below, currently pinned to upstream **v1.102.3**.
@@ -205,6 +208,74 @@ with `launchctl enable` before loading it again. Shutdown allows 45 seconds for
 cleanup. The daemon stays in launchd's process group to avoid orphaning it when
 the supervisor exits unexpectedly.
 
+## Menu-bar app
+
+First install/update the service so it provides the read-only `ui-status` endpoint:
+
+```sh
+go build -o tailscale-companion .
+./tailscale-companion install-service
+```
+
+Then build, test, and install the app **as your normal user**, without sudo:
+
+```sh
+go run ./cmd/menubar -test
+go run ./cmd/menubar -install
+```
+
+The Go packaging helper builds the native Swift/AppKit app, ad-hoc signs it for
+local use, installs `~/Applications/Tailscale Companion.app`, and loads a user
+LaunchAgent to show the icon now and at future GUI logins. It does not change the
+system daemon's state. Full Xcode is not required; the test helper supplies the
+extra Swift Testing framework paths needed by Command Line Tools installations.
+
+Click the **house icon** in the menu bar:
+
+- **Status:** service/connection state, personal IP when known, and routing readiness.
+- **Start Personal Tailscale:** authorize loading the existing system service.
+- **Shut Down Personal Tailscale:** authorize unloading it, allowing route cleanup.
+
+The icon uses a filled house/dot when connected with routing ready, an outline
+when stopped, and an attention badge during transitions or failures. Appearance
+follows macOS light/dark mode. Status polls every five seconds and refreshes when
+the menu opens. Controls are disabled while an action is pending; cancelling an
+authorization prompt is not treated as an error.
+
+The app is unprivileged. Status comes from the root-owned installed wrapper; it
+is never inferred from the work app. Privileged actions use fixed launchctl targets,
+not shell commands assembled from user input. No password is stored. No Accessibility
+permission is required by the app. If login/device approval is needed, the menu
+reports it; perform login through the CLI rather than exposing account controls.
+
+The menu app and daemon have separate lifecycles. Logging out of macOS stops the
+user UI but leaves the system service running. Shutting down from the menu unloads
+the service until started again or rebooted; it does not disable its boot policy.
+To stop just the menu app, leaving networking alone:
+
+```sh
+launchctl bootout "gui/$(id -u)/io.github.zlobober.tailscale-companion.menubar"
+```
+
+Its LaunchAgent is
+`~/Library/LaunchAgents/io.github.zlobober.tailscale-companion.menubar.plist`;
+UI logs are under `~/Library/Logs/TailscaleCompanion/`. Running the installer again
+rebuilds and replaces the UI. To disable its future login startup as well, use
+`launchctl disable "gui/$(id -u)/io.github.zlobober.tailscale-companion.menubar"`
+before unloading it. The installer re-enables it.
+
+Build without installing: `go run ./cmd/menubar` produces
+`dist/Tailscale Companion.app`. App bundles and Swift build caches are Git-ignored.
+This is a locally signed build, not a notarized distribution. The menu uses an
+original SF Symbols-based composition; no official Tailscale app artwork is copied.
+
+Read-only diagnostics:
+
+```sh
+./tailscale-companion ui-status
+"$HOME/Applications/Tailscale Companion.app/Contents/MacOS/TailscaleCompanionMenu" --status-json
+```
+
 ## Routing behavior and limitations
 
 Every three seconds, the monitor verifies the tailnet and node IP, discovers the
@@ -244,6 +315,9 @@ Important limits:
 - `routes.go`: identity checks, tunnel discovery, route lifecycle.
 - `service.go`: root-owned deployment and LaunchDaemon definition.
 - `settings.go`: local identity/prefix settings and validation.
+- `ui_status.go`: read-only connection/routing status for the unprivileged UI.
+- `macos/`: native AppKit menu app, service client, and Swift tests.
+- `cmd/menubar/`: Go app-bundle packager and per-user login-agent installer.
 - `*.example.json`: publishable templates, not active configuration.
 - `patches/`: pinned upstream daemon patch and license.
 - `*_test.go`: fake route/CLI operations, lifecycle and conflict tests, configuration,

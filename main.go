@@ -51,6 +51,7 @@ func usage() {
   --dry-run   Check config/binary and show startup settings; no sudo or changes.
   install-service  Install root-owned copies and migrate to a system LaunchDaemon.
   service-status   Show launchd's service status.
+  ui-status        Emit read-only JSON status for the menu-bar app.
   --print-plist    Print the LaunchDaemon definition without installing it.
 
 Route manager waits for personal login, discovers utun dynamically, and refuses
@@ -179,7 +180,7 @@ func run(args []string) error {
 	case "--help", "-h", "help":
 		usage()
 		return nil
-	case "start", "routes", "login", "--dry-run", "install-service", "service-status", "--print-plist":
+	case "start", "routes", "login", "--dry-run", "install-service", "service-status", "ui-status", "--print-plist":
 		if len(args) != 0 {
 			return errors.New("unexpected arguments")
 		}
@@ -190,6 +191,11 @@ func run(args []string) error {
 		return passthrough(args...)
 	default:
 		return fmt.Errorf("unknown command %q", action)
+	}
+	if action == "ui-status" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return json.NewEncoder(os.Stdout).Encode(collectUIStatus(ctx))
 	}
 	if action == "--print-plist" {
 		fmt.Print(servicePlist)

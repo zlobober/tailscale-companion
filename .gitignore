@@ -9,3 +9,6 @@
 *.log
 *.tfstate*
 .DS_Store
+/dist/
+/macos/.build/
+/macos/.swiftpm/
