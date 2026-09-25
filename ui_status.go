@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -27,8 +28,11 @@ type UIStatus struct {
 
 type daemonStatus struct {
 	BackendState   string
-	CurrentTailnet *struct{ Name string }
-	Self           *struct{ TailscaleIPs []string }
+	CurrentTailnet *struct {
+		Name           string
+		MagicDNSSuffix string
+	}
+	Self *struct{ TailscaleIPs []string }
 }
 
 func trustedServiceFile(path string) bool {
@@ -85,19 +89,29 @@ func describeConnection(s UIStatus, d daemonStatus, cfg companionSettings, iface
 		return s
 	}
 	s.Interface = iface
+	poolReady, serviceReady := false, false
 	for _, r := range routes {
+		if r.prefix == servicePrefix {
+			if r.iface != iface {
+				s.Detail = fmt.Sprintf("Routing conflict: %s uses %s", r.prefix, r.iface)
+				return s
+			}
+			serviceReady = true
+			continue
+		}
 		if r.prefix.Bits() >= prefix.Bits() && prefix.Contains(r.prefix.Addr()) && r.iface != iface {
 			s.Detail = fmt.Sprintf("Routing conflict: %s uses %s", r.prefix, r.iface)
 			return s
 		}
-	}
-	for _, r := range routes {
 		if r.prefix == prefix && r.iface == iface {
-			s.State, s.Detail, s.RouteReady = "connected", "Personal connection and IPv4 routing are ready", true
-			return s
+			poolReady = true
 		}
 	}
-	s.Detail = "Connected, waiting for the personal IPv4 route"
+	if poolReady && serviceReady {
+		s.State, s.Detail, s.RouteReady = "connected", "Personal connection, IPv4 routing, and split DNS are ready", true
+		return s
+	}
+	s.Detail = "Connected, waiting for the personal IPv4 and DNS routes"
 	return s
 }
 
@@ -153,6 +167,14 @@ func collectUIStatus(ctx context.Context) UIStatus {
 	s = describeConnection(s, d, cfg, iface, routes)
 	if routeErr != nil && d.BackendState == "Running" {
 		s.State, s.Detail, s.RouteReady = "degraded", "Connected; cannot verify the routing table", false
+		return s
+	}
+	if s.RouteReady {
+		path := filepath.Join(resolverDirectory, d.CurrentTailnet.MagicDNSSuffix)
+		contents, err := os.ReadFile(path)
+		if !validMagicDNSSuffix(d.CurrentTailnet.MagicDNSSuffix) || err != nil || string(contents) != string(resolverContents()) || !trustedServiceFile(path) {
+			s.State, s.Detail, s.RouteReady = "degraded", "Connected; split DNS is not installed safely", false
+		}
 	}
 	return s
 }

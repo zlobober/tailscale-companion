@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,9 +49,11 @@ func (f *fakeSystem) run(_ context.Context, cmd string, args ...string) ([]byte,
 			return nil, errors.New("wrong CLI invocation")
 		}
 		return json.Marshal(map[string]any{
-			"BackendState":   f.state,
-			"CurrentTailnet": map[string]string{"Name": f.tailnet},
-			"Self":           map[string]any{"TailscaleIPs": []string{f.ip}},
+			"BackendState": f.state,
+			"CurrentTailnet": map[string]string{
+				"Name": f.tailnet, "MagicDNSSuffix": "mau-newton.ts.net",
+			},
+			"Self": map[string]any{"TailscaleIPs": []string{f.ip}},
 		})
 	case "/usr/sbin/netstat":
 		out := "Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
@@ -58,22 +62,26 @@ func (f *fakeSystem) run(_ context.Context, cmd string, args ...string) ([]byte,
 		}
 		return []byte(out), nil
 	case "/sbin/route":
-		if len(args) != 6 || args[0] != "-n" || args[2] != "-net" || args[3] != personalCIDR || args[4] != "-interface" {
+		if len(args) != 6 || args[0] != "-n" || args[2] != "-net" || args[4] != "-interface" {
 			return nil, errors.New("unsafe route invocation")
 		}
-		f.actions = append(f.actions, args[1]+" "+args[5])
+		prefix, err := netip.ParsePrefix(args[3])
+		if err != nil || (prefix != pool && prefix != servicePrefix) {
+			return nil, errors.New("unsafe route prefix")
+		}
+		f.actions = append(f.actions, args[1]+" "+prefix.String()+" "+args[5])
 		switch args[1] {
 		case "add":
 			if f.failAdd {
 				return nil, errors.New("add failed")
 			}
-			f.routes = append(f.routes, routeEntry{pool, args[5]})
+			f.routes = append(f.routes, routeEntry{prefix, args[5]})
 		case "delete":
 			if f.failDelete {
 				return nil, errors.New("delete failed")
 			}
 			for i, r := range f.routes {
-				if r.prefix == pool && r.iface == args[5] {
+				if r.prefix == prefix && r.iface == args[5] {
 					f.routes = append(f.routes[:i], f.routes[i+1:]...)
 					break
 				}
@@ -94,7 +102,7 @@ func TestRouteLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := strings.Join(f.actions, ","); got != "add utun8" {
+	if got := strings.Join(f.actions, ","); got != "add 100.100.42.0/24 utun8,add 100.100.100.101/32 utun8" {
 		t.Fatal(got)
 	}
 	// Tunnel replacement: remove our previous route, then add on the discovered one.
@@ -103,7 +111,7 @@ func TestRouteLifecycle(t *testing.T) {
 	if err := m.step(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(f.actions, ","); got != "add utun8,delete utun8,add utun10" {
+	if got := strings.Join(f.actions, ","); got != "add 100.100.42.0/24 utun8,add 100.100.100.101/32 utun8,delete 100.100.42.0/24 utun8,delete 100.100.100.101/32 utun8,add 100.100.42.0/24 utun10,add 100.100.100.101/32 utun10" {
 		t.Fatal(got)
 	}
 	// Login loss removes the route but never touches work routes.
@@ -111,7 +119,7 @@ func TestRouteLifecycle(t *testing.T) {
 	if err := m.step(ctx); err == nil {
 		t.Fatal("expected waiting status")
 	}
-	if m.owned != "" || len(f.routes) != 3 {
+	if m.owned != "" || len(f.routes) != 3 || m.ownedPool || m.ownedService {
 		t.Fatal("cleanup failed")
 	}
 	if f.routes[1].iface != "utun7" {
@@ -126,7 +134,7 @@ func TestRouteLifecycle(t *testing.T) {
 	if err := m.watch(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if m.owned != "" || len(f.routes) != 3 {
+	if m.owned != "" || len(f.routes) != 3 || m.ownedPool || m.ownedService {
 		t.Fatal("signal cleanup failed")
 	}
 }
@@ -137,6 +145,8 @@ func TestRouteConflicts(t *testing.T) {
 		{"foreign host", "100.100.42.42/32", "utun7"},
 		{"foreign subprefix", "100.100.42.128/25", "utun7"},
 		{"unmanaged same interface", personalCIDR, "utun8"},
+		{"foreign service route", companionServiceIP + "/32", "utun7"},
+		{"unmanaged service route", companionServiceIP + "/32", "utun8"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, m := newFake()
@@ -217,8 +227,8 @@ func TestRouteOwnershipAndFailures(t *testing.T) {
 		if err := m.cleanup(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if len(f.actions) != 1 {
-			t.Fatal("deleted foreign replacement")
+		if got := strings.Join(f.actions, ","); got != "add 100.100.42.0/24 utun8,add 100.100.100.101/32 utun8,delete 100.100.42.0/24 utun8" {
+			t.Fatal("deleted foreign replacement", f.actions)
 		}
 	})
 	t.Run("missing route restored", func(t *testing.T) {
@@ -230,10 +240,53 @@ func TestRouteOwnershipAndFailures(t *testing.T) {
 		if err := m.step(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Join(f.actions, ",") != "add utun8,add utun8" {
+		if strings.Join(f.actions, ",") != "add 100.100.42.0/24 utun8,add 100.100.100.101/32 utun8,add 100.100.100.101/32 utun8" {
 			t.Fatal(f.actions)
 		}
 	})
+}
+
+func TestSplitDNSLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	m := &routeManager{resolverDir: dir, dnsSuffix: "mau-newton.ts.net", logf: func(string, ...any) {}}
+	path := filepath.Join(dir, m.dnsSuffix)
+	if err := m.ensureResolver(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != string(resolverContents()) {
+		t.Fatalf("resolver contents %q: %v", got, err)
+	}
+	if err := m.ensureResolver(); err != nil {
+		t.Fatal("idempotent install failed:", err)
+	}
+	if err := m.cleanupResolver(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("resolver file remains:", err)
+	}
+}
+
+func TestSplitDNSRefusesForeignFiles(t *testing.T) {
+	dir := t.TempDir()
+	m := &routeManager{resolverDir: dir, dnsSuffix: "mau-newton.ts.net", logf: func(string, ...any) {}}
+	path := filepath.Join(dir, m.dnsSuffix)
+	if err := os.WriteFile(path, []byte("nameserver 192.0.2.1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ensureResolver(); err == nil {
+		t.Fatal("replaced foreign resolver file")
+	}
+	if err := m.cleanupResolver(); err == nil {
+		t.Fatal("removed foreign resolver file")
+	}
+	if got, _ := os.ReadFile(path); string(got) != "nameserver 192.0.2.1\n" {
+		t.Fatal("foreign resolver file changed")
+	}
+	m.dnsSuffix = "../bad.ts.net"
+	if err := m.ensureResolver(); err == nil {
+		t.Fatal("accepted unsafe suffix")
+	}
 }
 
 func TestParseRoutes(t *testing.T) {

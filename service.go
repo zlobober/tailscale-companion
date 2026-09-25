@@ -343,11 +343,16 @@ func installService(p paths) error {
 		if err == nil {
 			routes, err := m.snapshot(context.Background())
 			if err == nil {
+				poolReady, serviceReady := false, false
 				for _, r := range routes {
-					if r.prefix == pool && r.iface == iface {
-						log.Printf("Verified personal tailnet is running and %s routes through %s", pool, iface)
-						return nil
-					}
+					poolReady = poolReady || r.prefix == pool && r.iface == iface
+					serviceReady = serviceReady || r.prefix == servicePrefix && r.iface == iface
+				}
+				resolverPath, resolverErr := m.resolverPath()
+				resolverData, readErr := os.ReadFile(resolverPath)
+				if poolReady && serviceReady && resolverErr == nil && readErr == nil && string(resolverData) == string(resolverContents()) {
+					log.Printf("Verified personal tailnet, routes %s and %s through %s, and split DNS", pool, servicePrefix, iface)
+					return nil
 				}
 			}
 		}

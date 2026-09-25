@@ -44,8 +44,8 @@ func pathsForExecutable(self string) paths {
 
 func usage() {
 	fmt.Println(`Usage: ./tailscale-companion [start | routes | login | cli COMMAND ... | --dry-run]
-  start       Supervise daemon + personal /24 route (sudo); Ctrl-C cleans up both.
-  routes      Manage routes for the already-running daemon (sudo); leaves it running.
+  start       Supervise daemon, personal route, and split DNS (sudo); Ctrl-C cleans up.
+  routes      Manage routes/DNS for the already-running daemon (sudo); leaves it running.
   login       Request browser login through the independent socket.
   cli ...     Run the Homebrew CLI through ONLY the independent socket.
   --dry-run   Check config/binary and show startup settings; no sudo or changes.
@@ -54,8 +54,9 @@ func usage() {
   ui-status        Emit read-only JSON status for the menu-bar app.
   --print-plist    Print the LaunchDaemon definition without installing it.
 
-Route manager waits for personal login, discovers utun dynamically, and refuses
-conflicting or unmanaged /24 routes. IPv6 routes and DNS are not managed.`)
+Manager waits for personal login, discovers utun dynamically, and refuses conflicting
+or unmanaged personal/service routes. Split DNS covers only the companion MagicDNS
+suffix; IPv6 routes are not managed.`)
 }
 
 func daemonArgs(p paths) []string {
@@ -228,9 +229,12 @@ func run(args []string) error {
 		if !strings.Contains(string(out), "-private-no-routes") {
 			return errors.New("binary lacks --private-no-routes")
 		}
+		if !strings.Contains(string(out), companionServiceIP) {
+			return fmt.Errorf("binary lacks companion DNS service IP %s", companionServiceIP)
+		}
 	}
 	if action == "--dry-run" {
-		fmt.Printf("Daemon: %s\nArguments: %q\nManaged route: %s\nExpected tailnet: %s\n", p.daemon, daemonArgs(p), personalCIDR, personalTailnet)
+		fmt.Printf("Daemon: %s\nArguments: %q\nManaged routes: %s, %s\nExpected tailnet: %s\n", p.daemon, daemonArgs(p), personalCIDR, servicePrefix, personalTailnet)
 		fmt.Println("Requires sudo; monitors every 3s, discovers utun, cleans up on SIGINT/SIGTERM. No changes made.")
 		return nil
 	}

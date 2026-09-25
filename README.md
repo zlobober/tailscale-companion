@@ -29,16 +29,19 @@ The App Store app's `IPNExtension` cannot simply be run as a second standalone
 Official Tailscale app                         System LaunchDaemon
   primary/work tailnet                          Tailscale Companion (Go supervisor)
   app-managed tunnel, routes, DNS                  ├─ patched tailscaled → another utun
-                                                  └─ monitor → one explicit IPv4 prefix
+                                                  └─ monitor → personal prefix + DNS service /32
 ```
 
 - **Patched daemon:** creates its tunnel, configures its own addresses, authenticates,
   and transports traffic. A private macOS-only `--private-no-routes` flag clears
   explicit OS route requests on every reconfiguration, preserving interface setup
-  and teardown. It does not suppress implicit kernel routes for local addresses.
+  and teardown. Its built-in DNS service uses companion-only `100.100.100.101`
+  instead of the standard `100.100.100.100`. The patch does not suppress implicit
+  kernel routes for local addresses.
 - **Go supervisor:** checks the authenticated tailnet, discovers the actual `utunN`,
-  checks for route conflicts, and manages the configured secondary IPv4 prefix.
-- **Daemon config:** disables DNS/subnet-route acceptance, exit-node use, route
+  checks for conflicts, manages the configured secondary IPv4 prefix and DNS service
+  `/32`, and installs split DNS for only the secondary MagicDNS suffix.
+- **Daemon config:** disables automatic DNS/subnet-route acceptance, exit-node use, route
   advertisements, and automatic updates that would replace the patched binary.
 - **launchd:** runs root-owned copies of the supervisor, daemon, CLI, and configuration
   independently of Terminal/user login, and restarts the service after exit.
@@ -73,8 +76,9 @@ are out of scope.
   Development expects its CLI at `/opt/homebrew/opt/tailscale/bin/tailscale`.
 - The patched daemon below, currently pinned to upstream **v1.102.3**.
 - Administrator approval to create the tunnel, modify routes, and install the service.
-- A dedicated IPv4 pool within Tailscale's CGNAT range for the secondary tailnet.
-  Configure the central policy separately and renumber existing devices as needed.
+- A dedicated IPv4 pool within Tailscale's CGNAT range and MagicDNS enabled for
+  the secondary tailnet. Configure the central policy separately and renumber existing
+  devices as needed.
 
 Only one secondary instance is supported. Service/state/socket paths are fixed;
 this is not a general-purpose multi-VPN manager.
@@ -92,7 +96,7 @@ git clone --branch v1.102.3 https://github.com/tailscale/tailscale.git ~/tailsca
 cd ~/tailscale
 git switch -c companion/no-routes
 git apply ~/agent/tailscale-companion/patches/tailscale-v1.102.3-no-routes.patch
-go test ./cmd/tailscaled -run '^TestNoRoutesRouter' -count=1
+go test ./cmd/tailscaled ./net/tsaddr -run 'Test(NoRoutesRouter|TailscaleServiceIP)' -count=1
 mkdir -p dist
 ./build_dist.sh -o dist/tailscaled-private ./cmd/tailscaled
 
@@ -118,8 +122,9 @@ Edit these **Git-ignored** local files:
 - `companion.json`: set `expectedTailnet` to the exact tailnet name reported by
   Tailscale, and `ipv4Prefix` to its dedicated allocation prefix. The example
   `100.100.42.0/24` is illustrative, not a universally safe choice.
-- `tailscaled.json`: choose the new device's `hostname`. Keep the DNS, routing,
-  exit-node, and update safety preferences disabled.
+- `tailscaled.json`: choose the new device's `hostname`. Keep automatic DNS and
+  routing, exit-node, and update safety preferences disabled. The supervisor installs
+  only the verified companion MagicDNS suffix itself.
 
 The blank tailnet in the example is intentional: starting without an explicit
 identity must fail rather than accidentally routing the primary network.
@@ -278,15 +283,20 @@ Read-only diagnostics:
 
 ## Routing behavior and limitations
 
-Every three seconds, the monitor verifies the tailnet and node IP, discovers the
-unique active tunnel that owns that IP, and inspects the IPv4 routing table.
+Every three seconds, the monitor verifies the tailnet, MagicDNS suffix, and node IP,
+discovers the unique active tunnel that owns that IP, and inspects the IPv4 routing
+table.
 
-- It adds only the configured IPv4 prefix. A broader primary `/10` is left alone.
+- It adds the configured IPv4 prefix and `100.100.100.101/32`. A broader primary
+  `/10` is left alone.
 - Equal/more-specific routes within the prefix pointing elsewhere are conflicts.
 - Existing unmanaged routes are not adopted, even on the same interface.
 - Reconnects/interface changes remove the owned old route before adding the new one.
-- Logout, wrong-tailnet selection, or orderly shutdown removes the owned route if
-  it still points to the recorded interface. Foreign replacement routes are preserved.
+- Logout, wrong-tailnet selection, or orderly shutdown removes both owned routes if
+  they still point to the recorded interface. Foreign replacement routes are preserved.
+- Once the expected tailnet is verified, it writes `/etc/resolver/<MagicDNS-suffix>`
+  pointing only that suffix at `100.100.100.101`; shutdown removes only an unchanged
+  file bearing the companion marker. Existing foreign resolver files are never replaced.
 - It never uses `route change` or deletes another route to force installation.
 
 Use `route -n get <secondary-peer-ip>` and an ordinary `ping` or application to
@@ -303,7 +313,9 @@ Important limits:
 - SIGKILL, crashes, and power loss cannot run cleanup. Inspect orphaned routes before
   removing them manually. A stale root-owned socket is removed only after confirming
   that no listener accepts connections; live sockets are never removed.
-- Secondary IPv6 routes, MagicDNS, and LAN subnet routing are deliberately absent.
+- Secondary IPv6 and LAN subnet routing are deliberately absent. MagicDNS is
+  available only for the companion tailnet's fully qualified `*.ts.net` suffix;
+  short-name search and personal-tailnet DNS policy beyond MagicDNS are not installed.
   Do not add the shared Tailscale IPv6 `/48` to the secondary tunnel.
 - The daemon config uses upstream's experimental `alpha0` format and is unlocked
   for interactive login. Do not override safety preferences through later CLI calls.
@@ -312,7 +324,7 @@ Important limits:
 ## Source map and tests
 
 - `main.go`: CLI commands, configuration validation, supervision.
-- `routes.go`: identity checks, tunnel discovery, route lifecycle.
+- `routes.go`: identity checks, tunnel discovery, route and split-DNS lifecycle.
 - `service.go`: root-owned deployment and LaunchDaemon definition.
 - `settings.go`: local identity/prefix settings and validation.
 - `ui_status.go`: read-only connection/routing status for the unprivileged UI.
@@ -323,7 +335,8 @@ Important limits:
 - `*_test.go`: fake route/CLI operations, lifecycle and conflict tests, configuration,
   deployment paths, and process selection. No live route changes are made by tests.
 
-Run `go test -race ./...` and `go vet ./...` before deploying. On upstream upgrades,
-review the macOS router implementation again: the private flag assumes explicit
-route operations are driven by the filtered configuration. Do not blindly replace
-the daemon with a stock binary.
+Run `go test -race ./...` and `go vet ./...` before deploying. On upstream
+upgrades, review the macOS router, DNS service-IP, and netstack implementations
+again: the private patch assumes explicit route operations are driven
+by the filtered configuration and that all service-IP consumers use `tsaddr`'s central
+value. Do not blindly replace the daemon with a stock binary.

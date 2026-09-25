@@ -75,7 +75,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         startItem.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
         stopItem.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: nil)
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let autosaveName = "TailscaleCompanionPersonal"
+        let positionKey = "NSStatusItem Preferred Position \(autosaveName)"
+        if UserDefaults.standard.object(forKey: positionKey) == nil {
+            // New status items default to the far left and can be hidden by a MacBook notch.
+            // Zero places the initial item on the visible right; AppKit persists later Cmd-drags.
+            UserDefaults.standard.set(0, forKey: positionKey)
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.autosaveName = autosaveName
+        statusItem.isVisible = true
         statusItem.menu = menu
         statusItem.button?.imagePosition = .imageOnly
         render()

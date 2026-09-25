@@ -8,16 +8,24 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
-	socketPath = "/var/run/tailscale-personal.socket"
+	socketPath         = "/var/run/tailscale-personal.socket"
+	companionServiceIP = "100.100.100.101"
+	resolverDirectory  = "/etc/resolver"
+	resolverHeader     = "# Added by tailscale-companion\n"
 )
+
+var servicePrefix = netip.MustParsePrefix(companionServiceIP + "/32")
 
 // Service mode uses a root-owned CLI copy, never a user-writable Homebrew binary.
 var cliPath = "/opt/homebrew/opt/tailscale/bin/tailscale"
@@ -138,12 +146,19 @@ type routeManager struct {
 	expectedTailnet string
 	run             commandRunner
 	tunnel          func(netip.Addr) (string, error)
-	owned           string // interface of the /24 successfully installed by this process
+	owned           string // interface shared by routes successfully installed by this process
+	ownedPool       bool
+	ownedService    bool
+	dnsSuffix       string
+	resolverDir     string
 	logf            func(string, ...any)
 }
 
 func newRouteManager() *routeManager {
-	return &routeManager{run: runCommand, tunnel: findTunnel, logf: log.Printf, expectedTailnet: personalTailnet}
+	return &routeManager{
+		run: runCommand, tunnel: findTunnel, logf: log.Printf,
+		expectedTailnet: personalTailnet, resolverDir: resolverDirectory,
+	}
 }
 
 func (m *routeManager) snapshot(ctx context.Context) ([]routeEntry, error) {
@@ -154,31 +169,168 @@ func (m *routeManager) snapshot(ctx context.Context) ([]routeEntry, error) {
 	return parseRoutes(out)
 }
 
-// cleanup never deletes an unmanaged route or a route now pointing elsewhere.
-// The kernel has no owner token: replacement with an identical prefix/interface
-// is indistinguishable. Do not run other managers for this prefix concurrently.
-func (m *routeManager) cleanup(ctx context.Context) error {
-	if m.owned == "" {
-		return nil
+func validMagicDNSSuffix(s string) bool {
+	if s == "" || s != strings.ToLower(s) || !strings.HasSuffix(s, ".ts.net") || strings.ContainsAny(s, "/\\:\t\r\n ") {
+		return false
 	}
-	routes, err := m.snapshot(ctx)
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return len(s) <= 253
+}
+
+func resolverContents() []byte {
+	return []byte(resolverHeader + "nameserver " + companionServiceIP + "\n")
+}
+
+func (m *routeManager) resolverPath() (string, error) {
+	if m.resolverDir == "" {
+		return "", nil
+	}
+	if !validMagicDNSSuffix(m.dnsSuffix) {
+		return "", fmt.Errorf("invalid companion MagicDNS suffix %q", m.dnsSuffix)
+	}
+	return filepath.Join(m.resolverDir, m.dnsSuffix), nil
+}
+
+func (m *routeManager) ensureResolver() error {
+	path, err := m.resolverPath()
+	if err != nil || path == "" {
+		return err
+	}
+	if info, err := os.Lstat(m.resolverDir); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(m.resolverDir, 0755); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("resolver path is not a real directory: %s", m.resolverDir)
+	} else if m.resolverDir == resolverDirectory {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != 0 || info.Mode().Perm()&0022 != 0 {
+			return fmt.Errorf("resolver directory is not safely root-owned: %s", m.resolverDir)
+		}
+	}
+	want := resolverContents()
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing non-regular resolver file %s", path)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if string(got) != string(want) {
+			return fmt.Errorf("refusing to replace unmanaged resolver file %s", path)
+		}
+		if err := os.Chmod(path, 0644); err != nil {
+			return err
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp := filepath.Join(m.resolverDir, fmt.Sprintf(".tailscale-companion-%d", os.Getpid()))
+	fd, err := syscall.Open(tmp, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0644)
 	if err != nil {
 		return err
 	}
-	present := false
-	for _, r := range routes {
-		if r.prefix == pool && r.iface == m.owned {
-			present = true
-		}
+	f := os.NewFile(uintptr(fd), tmp)
+	_, writeErr := f.Write(want)
+	chmodErr := f.Chmod(0644) // launchd's 0077 umask must not hide status from the menu app
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, chmodErr, syncErr, closeErr); err != nil {
+		os.Remove(tmp)
+		return err
 	}
-	if present {
-		if _, err := m.run(ctx, "/sbin/route", "-n", "delete", "-net", personalCIDR, "-interface", m.owned); err != nil {
-			return err
-		}
-		m.logf("Removed owned route %s via %s", personalCIDR, m.owned)
+	defer os.Remove(tmp)
+	if err := os.Link(tmp, path); err != nil {
+		return fmt.Errorf("install resolver file %s: %w", path, err)
 	}
-	m.owned = ""
+	m.logf("Installed split DNS for %s via %s", m.dnsSuffix, companionServiceIP)
 	return nil
+}
+
+func (m *routeManager) cleanupResolver() error {
+	if m.dnsSuffix == "" {
+		return nil
+	}
+	path, err := m.resolverPath()
+	if err != nil || path == "" {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing non-regular resolver file %s", path)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if string(got) != string(resolverContents()) {
+		return fmt.Errorf("refusing to remove changed resolver file %s", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	m.logf("Removed split DNS for %s", m.dnsSuffix)
+	return nil
+}
+
+// cleanup never deletes an unmanaged route or a route now pointing elsewhere.
+// The kernel has no owner token: replacement with an identical prefix/interface
+// is indistinguishable. Do not run other managers for these prefixes concurrently.
+func (m *routeManager) cleanup(ctx context.Context) error {
+	resolverErr := m.cleanupResolver()
+	if m.owned == "" {
+		return resolverErr
+	}
+	routes, err := m.snapshot(ctx)
+	if err != nil {
+		return errors.Join(resolverErr, err)
+	}
+	var errs []error
+	for _, target := range []struct {
+		prefix netip.Prefix
+		owned  *bool
+	}{{pool, &m.ownedPool}, {servicePrefix, &m.ownedService}} {
+		if !*target.owned {
+			continue
+		}
+		present := false
+		for _, r := range routes {
+			if r.prefix == target.prefix && r.iface == m.owned {
+				present = true
+			}
+		}
+		if present {
+			if _, err := m.run(ctx, "/sbin/route", "-n", "delete", "-net", target.prefix.String(), "-interface", m.owned); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			m.logf("Removed owned route %s via %s", target.prefix, m.owned)
+		}
+		*target.owned = false
+	}
+	if !m.ownedPool && !m.ownedService {
+		m.owned = ""
+	}
+	return errors.Join(append([]error{resolverErr}, errs...)...)
 }
 
 func (m *routeManager) desiredTunnel(ctx context.Context) (string, error) {
@@ -188,17 +340,24 @@ func (m *routeManager) desiredTunnel(ctx context.Context) (string, error) {
 	}
 	var status struct {
 		BackendState   string
-		CurrentTailnet *struct{ Name string }
-		Self           *struct{ TailscaleIPs []string }
+		CurrentTailnet *struct {
+			Name           string
+			MagicDNSSuffix string
+		}
+		Self *struct{ TailscaleIPs []string }
 	}
 	if err := json.Unmarshal(out, &status); err != nil {
 		return "", err
 	}
-	if status.BackendState != "Running" {
-		return "", fmt.Errorf("waiting for personal login/connection (%s)", status.BackendState)
-	}
 	if m.expectedTailnet == "" || status.CurrentTailnet == nil || status.CurrentTailnet.Name != m.expectedTailnet {
 		return "", errors.New("refusing routes: independent daemon is not in the personal tailnet")
+	}
+	if !validMagicDNSSuffix(status.CurrentTailnet.MagicDNSSuffix) {
+		return "", fmt.Errorf("refusing DNS: invalid MagicDNS suffix %q", status.CurrentTailnet.MagicDNSSuffix)
+	}
+	m.dnsSuffix = status.CurrentTailnet.MagicDNSSuffix
+	if status.BackendState != "Running" {
+		return "", fmt.Errorf("waiting for personal login/connection (%s)", status.BackendState)
 	}
 	if status.Self == nil {
 		return "", errors.New("personal daemon has no self node")
@@ -233,8 +392,18 @@ func (m *routeManager) step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	present := false
+	presentPool, presentService := false, false
 	for _, r := range routes {
+		if r.prefix == servicePrefix {
+			if r.iface != iface {
+				return errors.Join(fmt.Errorf("conflict: %s points to %s, not %s", r.prefix, r.iface, iface), m.cleanup(ctx))
+			}
+			if m.owned != iface || !m.ownedService {
+				return fmt.Errorf("%s via %s already exists and is unmanaged; refusing to adopt it", servicePrefix, iface)
+			}
+			presentService = true
+			continue
+		}
 		if r.prefix.Bits() < pool.Bits() || !pool.Contains(r.prefix.Addr()) {
 			continue // broad work /10 and default routes remain untouched
 		}
@@ -242,21 +411,39 @@ func (m *routeManager) step(ctx context.Context) error {
 			return errors.Join(fmt.Errorf("conflict: %s points to %s, not %s", r.prefix, r.iface, iface), m.cleanup(ctx))
 		}
 		if r.prefix == pool {
-			if m.owned != iface {
+			if m.owned != iface || !m.ownedPool {
 				return fmt.Errorf("%s via %s already exists and is unmanaged; refusing to adopt it", pool, iface)
 			}
-			present = true
+			presentPool = true
 		}
 	}
-	if present {
-		return nil
+	if m.ownedPool && !presentPool {
+		m.ownedPool = false // a previously owned route may have disappeared with the tunnel
 	}
-	m.owned = "" // a previously owned route may have disappeared with the tunnel
-	if _, err := m.run(ctx, "/sbin/route", "-n", "add", "-net", personalCIDR, "-interface", iface); err != nil {
-		return err // never use 'change' or delete another process's route on EEXIST
+	if m.ownedService && !presentService {
+		m.ownedService = false
 	}
-	m.owned = iface
-	m.logf("Installed %s via %s (personal tailnet verified)", personalCIDR, iface)
+	if !m.ownedPool && !m.ownedService {
+		m.owned = ""
+	}
+	for _, target := range []struct {
+		prefix  netip.Prefix
+		present bool
+		owned   *bool
+	}{{pool, presentPool, &m.ownedPool}, {servicePrefix, presentService, &m.ownedService}} {
+		if target.present {
+			continue
+		}
+		if _, err := m.run(ctx, "/sbin/route", "-n", "add", "-net", target.prefix.String(), "-interface", iface); err != nil {
+			return errors.Join(err, m.cleanup(ctx)) // never change or delete a foreign route on EEXIST
+		}
+		m.owned = iface
+		*target.owned = true
+		m.logf("Installed %s via %s (personal tailnet verified)", target.prefix, iface)
+	}
+	if err := m.ensureResolver(); err != nil {
+		return errors.Join(err, m.cleanup(ctx))
+	}
 	return nil
 }
 
@@ -280,7 +467,7 @@ func (m *routeManager) watch(ctx context.Context) error {
 			if message != "" {
 				m.logf("Route monitor: %s", message)
 			} else {
-				m.logf("Personal routing is ready")
+				m.logf("Personal routing and split DNS are ready")
 			}
 			lastError = message
 		}

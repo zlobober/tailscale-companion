@@ -1,5 +1,5 @@
 diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
-index d7c19f5..42c9d70 100644
+index d7c19f5..8940dc9 100644
 --- a/cmd/tailscaled/tailscaled.go
 +++ b/cmd/tailscaled/tailscaled.go
 @@ -125,6 +125,8 @@ func defaultPort() uint16 {
@@ -16,7 +16,7 @@ index d7c19f5..42c9d70 100644
  	}
  	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 +	if runtime.GOOS == "darwin" {
-+		flag.BoolVar(&args.privateNoRoutes, "private-no-routes", false, "private macOS option: configure tunnel addresses but do not manage routes; does not disable DNS management")
++		flag.BoolVar(&args.privateNoRoutes, "private-no-routes", false, "private macOS companion option: configure tunnel addresses but do not manage routes; built-in services use 100.100.100.101")
 +	}
  	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
  	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
@@ -32,6 +32,43 @@ index d7c19f5..42c9d70 100644
  		conf.Router = r
  		if handleSubnetsInNetstack() {
  			netstackSubnetRouter = true
+diff --git a/net/tsaddr/tsaddr.go b/net/tsaddr/tsaddr.go
+index 52f9d4d..6ab142d 100644
+--- a/net/tsaddr/tsaddr.go
++++ b/net/tsaddr/tsaddr.go
+@@ -50,7 +50,9 @@ func CGNATRange() netip.Prefix {
+ //
+ // For IPv6, use TailscaleServiceIPv6.
+ func TailscaleServiceIP() netip.Addr {
+-	return netaddr.IPv4(100, 100, 100, 100) // "100.100.100.100" for those grepping
++	// This private companion build uses a distinct service IP so its MagicDNS
++	// resolver can coexist with the official macOS app's quad-100 resolver.
++	return netaddr.IPv4(100, 100, 100, 101)
+ }
+ 
+ // TailscaleServiceIPv6 returns the IPv6 listen address of the services
+@@ -63,7 +65,7 @@ func TailscaleServiceIPv6() netip.Addr {
+ }
+ 
+ const (
+-	TailscaleServiceIPString   = "100.100.100.100"
++	TailscaleServiceIPString   = "100.100.100.101"
+ 	TailscaleServiceIPv6String = "fd7a:115c:a1e0::53"
+ )
+ 
+diff --git a/net/tsaddr/tsaddr_test.go b/net/tsaddr/tsaddr_test.go
+index fa88f33..7846fca 100644
+--- a/net/tsaddr/tsaddr_test.go
++++ b/net/tsaddr/tsaddr_test.go
+@@ -37,7 +37,7 @@ func TestInCrostiniRange(t *testing.T) {
+ 
+ func TestTailscaleServiceIP(t *testing.T) {
+ 	got := TailscaleServiceIP().String()
+-	want := "100.100.100.100"
++	want := "100.100.100.101"
+ 	if got != want {
+ 		t.Errorf("got %q; want %q", got, want)
+ 	}
 diff --git a/cmd/tailscaled/router_no_routes.go b/cmd/tailscaled/router_no_routes.go
 new file mode 100644
 index 0000000..d740cea
