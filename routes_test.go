@@ -15,6 +15,7 @@ import (
 type fakeSystem struct {
 	state, tailnet, ip, iface string
 	routes                    []routeEntry
+	services                  map[string][]string
 	actions                   []string
 	failAdd, failDelete       bool
 }
@@ -48,12 +49,17 @@ func (f *fakeSystem) run(_ context.Context, cmd string, args ...string) ([]byte,
 		if strings.Join(args, " ") != "--socket="+socketPath+" status --json" {
 			return nil, errors.New("wrong CLI invocation")
 		}
+		capMap := make(map[string]any)
+		for name, addrs := range f.services {
+			short := strings.TrimPrefix(name, "svc:")
+			capMap["services/"+short] = []any{map[string]any{"Name": name, "Addrs": addrs, "Ports": []string{"tcp:443"}}}
+		}
 		return json.Marshal(map[string]any{
 			"BackendState": f.state,
 			"CurrentTailnet": map[string]string{
 				"Name": f.tailnet, "MagicDNSSuffix": "mau-newton.ts.net",
 			},
-			"Self": map[string]any{"TailscaleIPs": []string{f.ip}},
+			"Self": map[string]any{"TailscaleIPs": []string{f.ip}, "CapMap": capMap},
 		})
 	case "/usr/sbin/netstat":
 		out := "Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n"
@@ -66,7 +72,8 @@ func (f *fakeSystem) run(_ context.Context, cmd string, args ...string) ([]byte,
 			return nil, errors.New("unsafe route invocation")
 		}
 		prefix, err := netip.ParsePrefix(args[3])
-		if err != nil || (prefix != pool && prefix != servicePrefix) {
+		cgnat := netip.MustParsePrefix("100.64.0.0/10")
+		if err != nil || (prefix != pool && prefix != servicePrefix && (prefix.Bits() != 32 || !cgnat.Contains(prefix.Addr()))) {
 			return nil, errors.New("unsafe route prefix")
 		}
 		f.actions = append(f.actions, args[1]+" "+prefix.String()+" "+args[5])
@@ -244,6 +251,63 @@ func TestRouteOwnershipAndFailures(t *testing.T) {
 			t.Fatal(f.actions)
 		}
 	})
+}
+
+func TestAuthorizedServiceRouteLifecycle(t *testing.T) {
+	f, m := newFake()
+	f.services = map[string][]string{"svc:grafana": {"100.99.151.209", "fd7a:115c:a1e0::1"}}
+	if err := m.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	vip := netip.MustParsePrefix("100.99.151.209/32")
+	if !m.ownedVIPs[vip] || !strings.Contains(strings.Join(f.actions, ","), "add 100.99.151.209/32 utun8") {
+		t.Fatal("TailVIP was not installed", f.actions)
+	}
+	if err := m.step(context.Background()); err != nil {
+		t.Fatal("idempotent service reconciliation failed:", err)
+	}
+	delete(f.services, "svc:grafana")
+	if err := m.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if m.ownedVIPs[vip] || !strings.Contains(strings.Join(f.actions, ","), "delete 100.99.151.209/32 utun8") {
+		t.Fatal("revoked TailVIP was not removed", f.actions)
+	}
+}
+
+func TestAuthorizedServiceRouteConflict(t *testing.T) {
+	f, m := newFake()
+	f.services = map[string][]string{"svc:grafana": {"100.99.151.209"}}
+	f.routes = append(f.routes, routeEntry{netip.MustParsePrefix("100.99.151.209/32"), "utun7"})
+	if err := m.step(context.Background()); err == nil {
+		t.Fatal("accepted TailVIP route owned by another tunnel")
+	}
+	if len(f.actions) != 0 {
+		t.Fatal("changed routes after conflict", f.actions)
+	}
+}
+
+func TestServiceCapabilityValidation(t *testing.T) {
+	makeStatus := func(capMap map[string][]json.RawMessage) daemonStatus {
+		return daemonStatus{Self: &daemonSelfStatus{CapMap: capMap}}
+	}
+	valid := json.RawMessage(`{"Name":"svc:grafana","Addrs":["100.99.151.209","fd7a:115c:a1e0::1"]}`)
+	routes, err := serviceRoutesFromStatus(makeStatus(map[string][]json.RawMessage{"services/grafana": {valid}}), pool)
+	if err != nil || len(routes) != 1 || routes[0].Name != "svc:grafana" || routes[0].IPv4 != "100.99.151.209" {
+		t.Fatal(routes, err)
+	}
+	for name, raw := range map[string]json.RawMessage{
+		"wrong name":    json.RawMessage(`{"Name":"svc:other","Addrs":["100.99.151.209"]}`),
+		"outside CGNAT": json.RawMessage(`{"Name":"svc:grafana","Addrs":["192.0.2.1"]}`),
+		"node pool":     json.RawMessage(`{"Name":"svc:grafana","Addrs":["100.100.42.99"]}`),
+		"bad address":   json.RawMessage(`{"Name":"svc:grafana","Addrs":["bad"]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := serviceRoutesFromStatus(makeStatus(map[string][]json.RawMessage{"services/grafana": {raw}}), pool); err == nil {
+				t.Fatal("accepted unsafe capability")
+			}
+		})
+	}
 }
 
 func TestSplitDNSLifecycle(t *testing.T) {

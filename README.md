@@ -40,7 +40,9 @@ Official Tailscale app                         System LaunchDaemon
   kernel routes for local addresses.
 - **Go supervisor:** checks the authenticated tailnet, discovers the actual `utunN`,
   checks for conflicts, manages the configured secondary IPv4 prefix and DNS service
-  `/32`, and installs split DNS for only the secondary MagicDNS suffix.
+  `/32`, installs exact `/32` routes for every authorized Tailscale Service TailVIP
+  reported in the daemon's capability map, and installs split DNS for only the
+  secondary MagicDNS suffix.
 - **Daemon config:** disables automatic DNS/subnet-route acceptance, exit-node use, route
   advertisements, and automatic updates that would replace the patched binary.
 - **launchd:** runs root-owned copies of the supervisor, daemon, CLI, and configuration
@@ -58,7 +60,8 @@ The menu-bar UI is deliberately limited to:
 
 1. Show secondary service/connection/routing status.
 2. Start the secondary service.
-3. Shut down the secondary service and remove its owned route.
+3. List the authorized Tailscale Services whose TailVIPs are currently routed.
+4. Shut down the secondary service and remove its owned routes.
 
 The UI uses native AppKit menus and a monochrome house icon with a state badge,
 clearly distinct from the official app's dots. Start/Shut Down requests use macOS's
@@ -129,7 +132,10 @@ Edit these **Git-ignored** local files:
 The blank tailnet in the example is intentional: starting without an explicit
 identity must fail rather than accidentally routing the primary network.
 The configured prefix must be canonical, within `100.64.0.0/10`, and must not
-include Tailscale's reserved ranges.
+include Tailscale's reserved ranges. Tailscale Services need no local allowlist:
+the supervisor reads only `services/*` capabilities authorized for this node and
+installs an exact IPv4 `/32` for each TailVIP. It removes the route when the
+capability disappears and never routes the full CGNAT range.
 
 No credentials, keys, or machine state belong in this repository. Browser login
 creates a separate device identity; the official app's state is never reused.
@@ -237,7 +243,8 @@ extra Swift Testing framework paths needed by Command Line Tools installations.
 
 Click the **house icon** in the menu bar:
 
-- **Status:** service/connection state, personal IP when known, and routing readiness.
+- **Status:** service/connection state, personal IP, routing readiness, and each
+  currently routed Tailscale Service with its IPv4 TailVIP.
 - **Start Personal Tailscale:** authorize loading the existing system service.
 - **Shut Down Personal Tailscale:** authorize unloading it, allowing route cleanup.
 

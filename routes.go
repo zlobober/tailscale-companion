@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,6 +52,84 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 type routeEntry struct {
 	prefix netip.Prefix
 	iface  string
+}
+
+type routedService struct {
+	Name   string `json:"name"`
+	IPv4   string `json:"ipv4"`
+	prefix netip.Prefix
+}
+
+type daemonSelfStatus struct {
+	TailscaleIPs []string
+	CapMap       map[string][]json.RawMessage
+}
+
+type daemonStatus struct {
+	BackendState   string
+	CurrentTailnet *struct {
+		Name           string
+		MagicDNSSuffix string
+	}
+	Self *daemonSelfStatus
+}
+
+func serviceRoutesFromStatus(status daemonStatus, nodePool netip.Prefix) ([]routedService, error) {
+	if status.Self == nil {
+		return nil, nil
+	}
+	cgnat := netip.MustParsePrefix("100.64.0.0/10")
+	var routes []routedService
+	seen := make(map[netip.Prefix]string)
+	for key, values := range status.Self.CapMap {
+		if !strings.HasPrefix(key, "services/") {
+			continue
+		}
+		shortName := strings.TrimPrefix(key, "services/")
+		if shortName == "" {
+			return nil, fmt.Errorf("invalid empty Tailscale Service capability %q", key)
+		}
+		wantName := "svc:" + shortName
+		for _, raw := range values {
+			var capability struct {
+				Name  string
+				Addrs []string
+			}
+			if err := json.Unmarshal(raw, &capability); err != nil {
+				return nil, fmt.Errorf("decode %s capability: %w", wantName, err)
+			}
+			if capability.Name != wantName {
+				return nil, fmt.Errorf("service capability %q names %q", key, capability.Name)
+			}
+			for _, value := range capability.Addrs {
+				ip, err := netip.ParseAddr(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid TailVIP %q for %s", value, wantName)
+				}
+				if !ip.Is4() {
+					continue // This companion deliberately manages IPv4 routes only.
+				}
+				prefix := netip.PrefixFrom(ip, 32)
+				if !cgnat.Contains(ip) || nodePool.Contains(ip) || ip.String() == companionServiceIP {
+					return nil, fmt.Errorf("unsafe TailVIP %s for %s", ip, wantName)
+				}
+				if previous, ok := seen[prefix]; ok && previous != wantName {
+					return nil, fmt.Errorf("TailVIP %s is assigned to both %s and %s", ip, previous, wantName)
+				}
+				seen[prefix] = wantName
+			}
+		}
+	}
+	for prefix, name := range seen {
+		routes = append(routes, routedService{Name: name, IPv4: prefix.Addr().String(), prefix: prefix})
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Name != routes[j].Name {
+			return routes[i].Name < routes[j].Name
+		}
+		return routes[i].IPv4 < routes[j].IPv4
+	})
+	return routes, nil
 }
 
 // netstat abbreviates IPv4 prefixes, e.g. 100.64/10 and 192.168.42.
@@ -148,7 +227,8 @@ type routeManager struct {
 	tunnel          func(netip.Addr) (string, error)
 	owned           string // interface shared by routes successfully installed by this process
 	ownedPool       bool
-	ownedService    bool
+	ownedService    bool // companion DNS service route
+	ownedVIPs       map[netip.Prefix]bool
 	dnsSuffix       string
 	resolverDir     string
 	logf            func(string, ...any)
@@ -158,6 +238,7 @@ func newRouteManager() *routeManager {
 	return &routeManager{
 		run: runCommand, tunnel: findTunnel, logf: log.Printf,
 		expectedTailnet: personalTailnet, resolverDir: resolverDirectory,
+		ownedVIPs: make(map[netip.Prefix]bool),
 	}
 }
 
@@ -304,95 +385,105 @@ func (m *routeManager) cleanup(ctx context.Context) error {
 	if err != nil {
 		return errors.Join(resolverErr, err)
 	}
-	var errs []error
-	for _, target := range []struct {
-		prefix netip.Prefix
-		owned  *bool
-	}{{pool, &m.ownedPool}, {servicePrefix, &m.ownedService}} {
-		if !*target.owned {
-			continue
+	present := make(map[netip.Prefix]bool)
+	for _, r := range routes {
+		if r.iface == m.owned {
+			present[r.prefix] = true
 		}
-		present := false
-		for _, r := range routes {
-			if r.prefix == target.prefix && r.iface == m.owned {
-				present = true
-			}
-		}
-		if present {
-			if _, err := m.run(ctx, "/sbin/route", "-n", "delete", "-net", target.prefix.String(), "-interface", m.owned); err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			m.logf("Removed owned route %s via %s", target.prefix, m.owned)
-		}
-		*target.owned = false
 	}
-	if !m.ownedPool && !m.ownedService {
+	var errs []error
+	remove := func(prefix netip.Prefix) bool {
+		if present[prefix] {
+			if _, err := m.run(ctx, "/sbin/route", "-n", "delete", "-net", prefix.String(), "-interface", m.owned); err != nil {
+				errs = append(errs, err)
+				return false
+			}
+			m.logf("Removed owned route %s via %s", prefix, m.owned)
+		}
+		return true
+	}
+	if m.ownedPool && remove(pool) {
+		m.ownedPool = false
+	}
+	if m.ownedService && remove(servicePrefix) {
+		m.ownedService = false
+	}
+	for prefix := range m.ownedVIPs {
+		if remove(prefix) {
+			delete(m.ownedVIPs, prefix)
+		}
+	}
+	if !m.ownedPool && !m.ownedService && len(m.ownedVIPs) == 0 {
 		m.owned = ""
 	}
 	return errors.Join(append([]error{resolverErr}, errs...)...)
 }
 
-func (m *routeManager) desiredTunnel(ctx context.Context) (string, error) {
+func (m *routeManager) desiredRoutes(ctx context.Context) (string, []routedService, error) {
 	out, err := m.run(ctx, cliPath, "--socket="+socketPath, "status", "--json")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	var status struct {
-		BackendState   string
-		CurrentTailnet *struct {
-			Name           string
-			MagicDNSSuffix string
-		}
-		Self *struct{ TailscaleIPs []string }
-	}
+	var status daemonStatus
 	if err := json.Unmarshal(out, &status); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if m.expectedTailnet == "" || status.CurrentTailnet == nil || status.CurrentTailnet.Name != m.expectedTailnet {
-		return "", errors.New("refusing routes: independent daemon is not in the personal tailnet")
+		return "", nil, errors.New("refusing routes: independent daemon is not in the personal tailnet")
 	}
 	if !validMagicDNSSuffix(status.CurrentTailnet.MagicDNSSuffix) {
-		return "", fmt.Errorf("refusing DNS: invalid MagicDNS suffix %q", status.CurrentTailnet.MagicDNSSuffix)
+		return "", nil, fmt.Errorf("refusing DNS: invalid MagicDNS suffix %q", status.CurrentTailnet.MagicDNSSuffix)
 	}
 	m.dnsSuffix = status.CurrentTailnet.MagicDNSSuffix
 	if status.BackendState != "Running" {
-		return "", fmt.Errorf("waiting for personal login/connection (%s)", status.BackendState)
+		return "", nil, fmt.Errorf("waiting for personal login/connection (%s)", status.BackendState)
 	}
 	if status.Self == nil {
-		return "", errors.New("personal daemon has no self node")
+		return "", nil, errors.New("personal daemon has no self node")
+	}
+	services, err := serviceRoutesFromStatus(status, pool)
+	if err != nil {
+		return "", nil, err
 	}
 	for _, s := range status.Self.TailscaleIPs {
 		ip, err := netip.ParseAddr(s)
 		if err == nil && ip.Is4() {
 			if !pool.Contains(ip) {
-				return "", fmt.Errorf("personal node address %s is outside %s", ip, pool)
+				return "", nil, fmt.Errorf("personal node address %s is outside %s", ip, pool)
 			}
 			iface, err := m.tunnel(ip)
 			if err == nil && !utunName.MatchString(iface) {
-				return "", fmt.Errorf("invalid tunnel name %q", iface)
+				return "", nil, fmt.Errorf("invalid tunnel name %q", iface)
 			}
-			return iface, err
+			return iface, services, err
 		}
 	}
-	return "", errors.New("personal daemon has no IPv4 address")
+	return "", nil, errors.New("personal daemon has no IPv4 address")
 }
 
 func (m *routeManager) step(ctx context.Context) error {
-	iface, err := m.desiredTunnel(ctx)
+	iface, services, err := m.desiredRoutes(ctx)
 	if err != nil {
 		return errors.Join(err, m.cleanup(ctx))
+	}
+	if m.ownedVIPs == nil {
+		m.ownedVIPs = make(map[netip.Prefix]bool)
 	}
 	if m.owned != "" && m.owned != iface {
 		if err := m.cleanup(ctx); err != nil {
 			return err
 		}
 	}
+	desiredVIPs := make(map[netip.Prefix]routedService)
+	for _, service := range services {
+		desiredVIPs[service.prefix] = service
+	}
 	routes, err := m.snapshot(ctx)
 	if err != nil {
 		return err
 	}
 	presentPool, presentService := false, false
+	presentVIPs := make(map[netip.Prefix]bool)
 	for _, r := range routes {
 		if r.prefix == servicePrefix {
 			if r.iface != iface {
@@ -402,6 +493,17 @@ func (m *routeManager) step(ctx context.Context) error {
 				return fmt.Errorf("%s via %s already exists and is unmanaged; refusing to adopt it", servicePrefix, iface)
 			}
 			presentService = true
+			continue
+		}
+		_, wantedVIP := desiredVIPs[r.prefix]
+		if wantedVIP || m.ownedVIPs[r.prefix] {
+			if r.iface != iface {
+				return errors.Join(fmt.Errorf("conflict: TailVIP %s points to %s, not %s", r.prefix, r.iface, iface), m.cleanup(ctx))
+			}
+			if m.owned != iface || !m.ownedVIPs[r.prefix] {
+				return fmt.Errorf("TailVIP %s via %s already exists and is unmanaged; refusing to adopt it", r.prefix, iface)
+			}
+			presentVIPs[r.prefix] = true
 			continue
 		}
 		if r.prefix.Bits() < pool.Bits() || !pool.Contains(r.prefix.Addr()) {
@@ -423,7 +525,22 @@ func (m *routeManager) step(ctx context.Context) error {
 	if m.ownedService && !presentService {
 		m.ownedService = false
 	}
-	if !m.ownedPool && !m.ownedService {
+	for prefix := range m.ownedVIPs {
+		if _, wanted := desiredVIPs[prefix]; !wanted {
+			if present := presentVIPs[prefix]; present {
+				if _, err := m.run(ctx, "/sbin/route", "-n", "delete", "-net", prefix.String(), "-interface", iface); err != nil {
+					return errors.Join(err, m.cleanup(ctx))
+				}
+				m.logf("Removed no-longer-authorized TailVIP route %s via %s", prefix, iface)
+			}
+			delete(m.ownedVIPs, prefix)
+			continue
+		}
+		if !presentVIPs[prefix] {
+			delete(m.ownedVIPs, prefix)
+		}
+	}
+	if !m.ownedPool && !m.ownedService && len(m.ownedVIPs) == 0 {
 		m.owned = ""
 	}
 	for _, target := range []struct {
@@ -440,6 +557,17 @@ func (m *routeManager) step(ctx context.Context) error {
 		m.owned = iface
 		*target.owned = true
 		m.logf("Installed %s via %s (personal tailnet verified)", target.prefix, iface)
+	}
+	for _, service := range services {
+		if presentVIPs[service.prefix] {
+			continue
+		}
+		if _, err := m.run(ctx, "/sbin/route", "-n", "add", "-net", service.prefix.String(), "-interface", iface); err != nil {
+			return errors.Join(err, m.cleanup(ctx))
+		}
+		m.owned = iface
+		m.ownedVIPs[service.prefix] = true
+		m.logf("Installed TailVIP route %s for %s via %s", service.prefix, service.Name, iface)
 	}
 	if err := m.ensureResolver(); err != nil {
 		return errors.Join(err, m.cleanup(ctx))

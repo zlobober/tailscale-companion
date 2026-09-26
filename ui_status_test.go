@@ -10,7 +10,7 @@ import (
 
 func TestUIConnectionStatus(t *testing.T) {
 	var d daemonStatus
-	if err := json.Unmarshal([]byte(`{"BackendState":"Running","CurrentTailnet":{"Name":"personal.example","MagicDNSSuffix":"mau-newton.ts.net"},"Self":{"TailscaleIPs":["100.100.42.10"]}}`), &d); err != nil {
+	if err := json.Unmarshal([]byte(`{"BackendState":"Running","CurrentTailnet":{"Name":"personal.example","MagicDNSSuffix":"mau-newton.ts.net"},"Self":{"TailscaleIPs":["100.100.42.10"],"CapMap":{"services/grafana":[{"Name":"svc:grafana","Addrs":["100.99.151.209"],"Ports":["tcp:443"]}]}}}`), &d); err != nil {
 		t.Fatal(err)
 	}
 	cfg := companionSettings{"personal.example", "100.100.42.0/24"}
@@ -19,9 +19,10 @@ func TestUIConnectionStatus(t *testing.T) {
 		{netip.MustParsePrefix("100.64.0.0/10"), "utun7"},
 		{netip.MustParsePrefix(cfg.IPv4Prefix), "utun8"},
 		{servicePrefix, "utun8"},
+		{netip.MustParsePrefix("100.99.151.209/32"), "utun8"},
 	}
 	got := describeConnection(base, d, cfg, "utun8", routes)
-	if got.State != "connected" || !got.RouteReady || got.IPv4 != "100.100.42.10" {
+	if got.State != "connected" || !got.RouteReady || got.IPv4 != "100.100.42.10" || len(got.RoutedServices) != 1 || got.RoutedServices[0].Name != "svc:grafana" {
 		t.Fatal(got)
 	}
 	got = describeConnection(base, d, cfg, "utun8", routes[:1])
@@ -34,7 +35,7 @@ func TestUIConnectionStatus(t *testing.T) {
 		t.Fatal("conflicting route shown as connected", got)
 	}
 	d.CurrentTailnet.Name = "work.example"
-	got = describeConnection(base, d, cfg, "utun8", routes[:3])
+	got = describeConnection(base, d, cfg, "utun8", routes)
 	if got.State != "degraded" || got.RouteReady {
 		t.Fatal("wrong tailnet shown as connected", got)
 	}

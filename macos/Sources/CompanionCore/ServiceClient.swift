@@ -1,6 +1,16 @@
 import Foundation
 import Darwin
 
+public struct RoutedService: Decodable, Equatable, Sendable {
+    public let name: String
+    public let ipv4: String
+
+    public init(name: String, ipv4: String) {
+        self.name = name
+        self.ipv4 = ipv4
+    }
+}
+
 public struct Snapshot: Decodable, Equatable, Sendable {
     public let serviceInstalled: Bool
     public let serviceLoaded: Bool
@@ -10,11 +20,13 @@ public struct Snapshot: Decodable, Equatable, Sendable {
     public let ipv4: String?
     public let interface: String?
     public let routeReady: Bool
+    public let routedServices: [RoutedService]
 
     public init(serviceInstalled: Bool = false, serviceLoaded: Bool = false,
                 state: String = "unavailable", detail: String,
                 tailnet: String? = nil, ipv4: String? = nil,
-                interface: String? = nil, routeReady: Bool = false) {
+                interface: String? = nil, routeReady: Bool = false,
+                routedServices: [RoutedService] = []) {
         self.serviceInstalled = serviceInstalled
         self.serviceLoaded = serviceLoaded
         self.state = state
@@ -23,6 +35,24 @@ public struct Snapshot: Decodable, Equatable, Sendable {
         self.ipv4 = ipv4
         self.interface = interface
         self.routeReady = routeReady
+        self.routedServices = routedServices
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case serviceInstalled, serviceLoaded, state, detail, tailnet, ipv4, interface, routeReady, routedServices
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        serviceInstalled = try values.decode(Bool.self, forKey: .serviceInstalled)
+        serviceLoaded = try values.decode(Bool.self, forKey: .serviceLoaded)
+        state = try values.decode(String.self, forKey: .state)
+        detail = try values.decode(String.self, forKey: .detail)
+        tailnet = try values.decodeIfPresent(String.self, forKey: .tailnet)
+        ipv4 = try values.decodeIfPresent(String.self, forKey: .ipv4)
+        interface = try values.decodeIfPresent(String.self, forKey: .interface)
+        routeReady = try values.decode(Bool.self, forKey: .routeReady)
+        routedServices = try values.decodeIfPresent([RoutedService].self, forKey: .routedServices) ?? []
     }
 
     public var isConnected: Bool { state == "connected" && routeReady }

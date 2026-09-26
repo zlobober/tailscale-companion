@@ -32,6 +32,16 @@ struct ServiceClientTests {
         #expect(!Snapshot(state: "not-installed", detail: "").canStart)
     }
 
+    @Test func decodesRoutedServices() {
+        let data = try! JSONSerialization.data(withJSONObject: [
+            "serviceInstalled": true, "serviceLoaded": true, "state": "connected",
+            "detail": "ready", "routeReady": true,
+            "routedServices": [["name": "svc:grafana", "ipv4": "100.99.151.209"]]
+        ])
+        let snapshot = try! JSONDecoder().decode(Snapshot.self, from: data)
+        #expect(snapshot.routedServices == [RoutedService(name: "svc:grafana", ipv4: "100.99.151.209")])
+    }
+
     @Test func readOnlyStatusUsesOnlyInstalledWrapper() {
         let runner = FakeRunner([status("connected", loaded: true, ready: true)])
         let result = ServiceClient(runner: runner).status()

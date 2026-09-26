@@ -16,23 +16,15 @@ import (
 // UIStatus is the read-only interface used by the unprivileged menu-bar app.
 // State describes connectivity AND routing, not just whether a process exists.
 type UIStatus struct {
-	ServiceInstalled bool   `json:"serviceInstalled"`
-	ServiceLoaded    bool   `json:"serviceLoaded"`
-	State            string `json:"state"`
-	Detail           string `json:"detail"`
-	Tailnet          string `json:"tailnet,omitempty"`
-	IPv4             string `json:"ipv4,omitempty"`
-	Interface        string `json:"interface,omitempty"`
-	RouteReady       bool   `json:"routeReady"`
-}
-
-type daemonStatus struct {
-	BackendState   string
-	CurrentTailnet *struct {
-		Name           string
-		MagicDNSSuffix string
-	}
-	Self *struct{ TailscaleIPs []string }
+	ServiceInstalled bool            `json:"serviceInstalled"`
+	ServiceLoaded    bool            `json:"serviceLoaded"`
+	State            string          `json:"state"`
+	Detail           string          `json:"detail"`
+	Tailnet          string          `json:"tailnet,omitempty"`
+	IPv4             string          `json:"ipv4,omitempty"`
+	Interface        string          `json:"interface,omitempty"`
+	RouteReady       bool            `json:"routeReady"`
+	RoutedServices   []routedService `json:"routedServices"`
 }
 
 func trustedServiceFile(path string) bool {
@@ -89,7 +81,13 @@ func describeConnection(s UIStatus, d daemonStatus, cfg companionSettings, iface
 		return s
 	}
 	s.Interface = iface
+	desiredServices, err := serviceRoutesFromStatus(d, prefix)
+	if err != nil {
+		s.Detail = "Connected; cannot safely decode authorized Tailscale Services"
+		return s
+	}
 	poolReady, serviceReady := false, false
+	readyVIPs := make(map[netip.Prefix]bool)
 	for _, r := range routes {
 		if r.prefix == servicePrefix {
 			if r.iface != iface {
@@ -99,6 +97,15 @@ func describeConnection(s UIStatus, d daemonStatus, cfg companionSettings, iface
 			serviceReady = true
 			continue
 		}
+		for _, service := range desiredServices {
+			if r.prefix == service.prefix {
+				if r.iface != iface {
+					s.Detail = fmt.Sprintf("Routing conflict: %s uses %s", r.prefix, r.iface)
+					return s
+				}
+				readyVIPs[r.prefix] = true
+			}
+		}
 		if r.prefix.Bits() >= prefix.Bits() && prefix.Contains(r.prefix.Addr()) && r.iface != iface {
 			s.Detail = fmt.Sprintf("Routing conflict: %s uses %s", r.prefix, r.iface)
 			return s
@@ -107,11 +114,16 @@ func describeConnection(s UIStatus, d daemonStatus, cfg companionSettings, iface
 			poolReady = true
 		}
 	}
-	if poolReady && serviceReady {
-		s.State, s.Detail, s.RouteReady = "connected", "Personal connection, IPv4 routing, and split DNS are ready", true
+	for _, service := range desiredServices {
+		if readyVIPs[service.prefix] {
+			s.RoutedServices = append(s.RoutedServices, service)
+		}
+	}
+	if poolReady && serviceReady && len(s.RoutedServices) == len(desiredServices) {
+		s.State, s.Detail, s.RouteReady = "connected", "Personal connection, IPv4, Service routing, and split DNS are ready", true
 		return s
 	}
-	s.Detail = "Connected, waiting for the personal IPv4 and DNS routes"
+	s.Detail = "Connected, waiting for the personal IPv4, Service, and DNS routes"
 	return s
 }
 

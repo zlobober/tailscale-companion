@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -339,19 +340,27 @@ func installService(p paths) error {
 	m := newRouteManager()
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
-		iface, err := m.desiredTunnel(context.Background())
+		iface, services, err := m.desiredRoutes(context.Background())
 		if err == nil {
 			routes, err := m.snapshot(context.Background())
 			if err == nil {
 				poolReady, serviceReady := false, false
+				readyVIPs := make(map[netip.Prefix]bool)
 				for _, r := range routes {
 					poolReady = poolReady || r.prefix == pool && r.iface == iface
 					serviceReady = serviceReady || r.prefix == servicePrefix && r.iface == iface
+					if r.iface == iface {
+						readyVIPs[r.prefix] = true
+					}
+				}
+				allVIPsReady := true
+				for _, service := range services {
+					allVIPsReady = allVIPsReady && readyVIPs[service.prefix]
 				}
 				resolverPath, resolverErr := m.resolverPath()
 				resolverData, readErr := os.ReadFile(resolverPath)
-				if poolReady && serviceReady && resolverErr == nil && readErr == nil && string(resolverData) == string(resolverContents()) {
-					log.Printf("Verified personal tailnet, routes %s and %s through %s, and split DNS", pool, servicePrefix, iface)
+				if poolReady && serviceReady && allVIPsReady && resolverErr == nil && readErr == nil && string(resolverData) == string(resolverContents()) {
+					log.Printf("Verified personal tailnet, base routes and %d Service route(s) through %s, and split DNS", len(services), iface)
 					return nil
 				}
 			}

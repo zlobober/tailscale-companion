@@ -55,8 +55,9 @@ func usage() {
   --print-plist    Print the LaunchDaemon definition without installing it.
 
 Manager waits for personal login, discovers utun dynamically, and refuses conflicting
-or unmanaged personal/service routes. Split DNS covers only the companion MagicDNS
-suffix; IPv6 routes are not managed.`)
+or unmanaged personal/service routes. Authorized Tailscale Services receive exact
+IPv4 /32 routes. Split DNS covers only the companion MagicDNS suffix; IPv6 routes
+are not managed.`)
 }
 
 func daemonArgs(p paths) []string {
@@ -234,7 +235,7 @@ func run(args []string) error {
 		}
 	}
 	if action == "--dry-run" {
-		fmt.Printf("Daemon: %s\nArguments: %q\nManaged routes: %s, %s\nExpected tailnet: %s\n", p.daemon, daemonArgs(p), personalCIDR, servicePrefix, personalTailnet)
+		fmt.Printf("Daemon: %s\nArguments: %q\nManaged base routes: %s, %s\nDynamic routes: authorized Tailscale Service IPv4 TailVIPs (/32)\nExpected tailnet: %s\n", p.daemon, daemonArgs(p), personalCIDR, servicePrefix, personalTailnet)
 		fmt.Println("Requires sudo; monitors every 3s, discovers utun, cleans up on SIGINT/SIGTERM. No changes made.")
 		return nil
 	}

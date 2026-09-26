@@ -40,6 +40,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private let connectionItem = NSMenuItem(title: "Status: Checking…", action: nil, keyEquivalent: "")
     private let addressItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let routingItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let servicesHeading = NSMenuItem(title: "Routed Services", action: nil, keyEquivalent: "")
+    private var serviceItems: [NSMenuItem] = []
     private let startItem = NSMenuItem(title: "Start Personal Tailscale", action: #selector(startService), keyEquivalent: "")
     private let stopItem = NSMenuItem(title: "Shut Down Personal Tailscale", action: #selector(stopService), keyEquivalent: "")
     private var snapshot = Snapshot(detail: "Checking the personal service")
@@ -64,10 +66,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
         heading.isEnabled = false
         menu.addItem(heading)
-        for item in [connectionItem, addressItem, routingItem] {
+        for item in [connectionItem, addressItem, routingItem, servicesHeading] {
             item.isEnabled = false
             menu.addItem(item)
         }
+        servicesHeading.attributedTitle = NSAttributedString(string: servicesHeading.title,
+            attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize)])
         menu.addItem(.separator())
         for item in [startItem, stopItem] {
             item.target = self
@@ -136,6 +140,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         routingItem.isHidden = !snapshot.serviceLoaded
         routingItem.title = snapshot.routeReady ? "Routing: Ready" : "Routing: Not ready"
         routingItem.toolTip = snapshot.detail
+        for item in serviceItems { menu.removeItem(item) }
+        serviceItems.removeAll()
+        servicesHeading.isHidden = snapshot.routedServices.isEmpty
+        if let headingIndex = menu.items.firstIndex(of: servicesHeading) {
+            for (offset, service) in snapshot.routedServices.enumerated() {
+                let displayName = service.name.hasPrefix("svc:") ? String(service.name.dropFirst(4)) : service.name
+                let item = NSMenuItem(title: "\(displayName): \(service.ipv4)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                item.toolTip = service.name
+                menu.insertItem(item, at: headingIndex + 1 + offset)
+                serviceItems.append(item)
+            }
+        }
         startItem.isEnabled = !busy && snapshot.canStart
         stopItem.isEnabled = !busy && snapshot.canStop
         let attention = ["degraded", "needs-login", "unavailable", "not-installed"].contains(snapshot.state)
@@ -184,7 +201,8 @@ private enum AppMain {
         if CommandLine.arguments.contains("--status-json") {
             let result = ServiceClient().status()
             let fields: [String: Any] = ["state": result.state, "detail": result.detail,
-                "serviceLoaded": result.serviceLoaded, "routeReady": result.routeReady]
+                "serviceLoaded": result.serviceLoaded, "routeReady": result.routeReady,
+                "routedServices": result.routedServices.map { ["name": $0.name, "ipv4": $0.ipv4] }]
             if let data = try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys]),
                let text = String(data: data, encoding: .utf8) { print(text) }
             return
